@@ -1,0 +1,5 @@
+powershell
+
+mkdir -p bin
+gcc -O2 -std=c11 -Iinclude src/*.c -o bin/gaacosp -lm
+./bin/gaacosp data/comp01.ctt
