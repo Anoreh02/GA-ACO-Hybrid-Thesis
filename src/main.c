@@ -25,7 +25,7 @@ int main(int argc, char** argv){
 
     // Small, fast settings first so you see output quickly. Tune up later.
     GAParams gp = {.pop_size=40, .iters=30, .pm=0.05};
-    ACOParams ap = {.ants=40, .iters=120, .alpha=1.0, .beta=4.5, .rho=0.2, .init_tau=0.1, .selective_p=0.30};
+    ACOParams ap = {.ants=32, .iters=100, .alpha=1.0, .beta=4.5, .rho=0.2, .init_tau=0.1, .selective_p=0.30};
 
     double t0 = now_sec();
 

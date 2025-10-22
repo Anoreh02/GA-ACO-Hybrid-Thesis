@@ -8,6 +8,7 @@
 #include <stdio.h>
 #define TRACE(fmt, ...) do { fprintf(stderr, "[ACO] " fmt "\n", ##__VA_ARGS__); fflush(stderr); } while(0)
 #define SOFT_ENABLE_CC 1
+#define SOFT_PASSES 3
 
 
 // -------------------- helpers & utilities --------------------
@@ -358,33 +359,59 @@ static void repair_basic(Instance* I, Timetable* S){
 
 // -------------------- candidate weighting with current occupancy --------------------
 
+// candidate weight with current occupancy/clash map and capacity awareness
+// candidate weight with current occupancy/clash map and capacity awareness
 static double weight_for(ACOParams P, Instance* I, int L, int t,
                          double tauLt,
                          int (*occ_room_time)[MAX_TIMESLOTS],
                          int *slot_used)
 {
     int c = I->lecture_to_course[L];
-    if(!I->feasible[c][t]) return 0.0;
+    if (t < 0 || t >= I->num_timeslots) return 0.0;
+    if (!I->feasible[c][t]) return 0.0;
 
-    // reject teacher/curriculum clash with already-placed courses at time t
-    for(int cc=0; cc<I->num_courses; ++cc)
-        if(slot_used[t*I->num_courses + cc] && I->conflict[c][cc]) return 0.0;
+    // HARD GUARD #1: same course already has a lecture at t → forbid
+    if (slot_used[t * I->num_courses + c]) return 0.0;
 
-    // best capacity among rooms still free at t
-    int need = I->courses[c].students;
-    int free_exists = 0, best_cap = 1000000000, min_over = 1000000000;
-    for(int r=0; r<I->num_rooms; ++r){
-        if(occ_room_time[r][t]) continue;         // room already taken at t
-        int over = need - I->rooms[r].capacity;    // <=0 means fits
-        if(over <= 0){ free_exists = 1; if(I->rooms[r].capacity < best_cap) best_cap = I->rooms[r].capacity; }
-        if(over < min_over) min_over = over;
+    // HARD GUARD #2: clash with other courses already at t (curriculum/teacher)
+    for (int cc = 0; cc < I->num_courses; ++cc) {
+        if (slot_used[t * I->num_courses + cc] && I->conflict[c][cc])
+            return 0.0;
     }
 
-    double eta = free_exists ? (5.0 + 1.0/(1.0 + (double)best_cap))
-                             : (1.0 / (1.0 + (double)((min_over>0)?min_over:0)));
-    if(eta < 1e-12) eta = 1e-12;
+    // capacity scan among rooms FREE at time t
+    int need = I->courses[c].students;
+    int fit_free = 0;                     // any free room that FITS at t?
+    int best_cap = 1000000000;            // smallest capacity among fitting free rooms
+    int min_over = 1000000000;            // least overflow among free rooms (if none fit)
+
+    for (int r = 0; r < I->num_rooms; ++r) {
+        if (occ_room_time[r][t] > 0) continue;   // room already used at (r,t)
+        int cap  = I->rooms[r].capacity;
+        int over = need - cap;                    // <=0 means fits
+        if (over <= 0) {
+            fit_free = 1;
+            if (cap < best_cap) best_cap = cap;  // prefer tight fits
+        } else if (over < min_over) {
+            min_over = over;
+        }
+    }
+
+    // capacity-driven heuristic
+    double eta;
+    if (fit_free) {
+        // prefer smaller fitting rooms
+        eta = 6.0 + 3.0 / (1.0 + (double)best_cap);
+    } else {
+        // no free fitting room → strongly discourage
+        double of = (double)(min_over > 0 ? min_over : 0);
+        eta = 1e-9 / (1.0 + 0.03 * of);
+    }
+    if (eta < 1e-12) eta = 1e-12;
+
     return pow(tauLt, P.alpha) * pow(eta, P.beta);
 }
+
 
 // -------------------- main ACO kernel --------------------
 
@@ -658,16 +685,180 @@ static int improve_room_stability_once(const Instance* I, Timetable* S){
 // full soft improvement (few cheap passes)
 static void soft_post_opt(const Instance* I, Timetable* S){
     // TRACE("    soft: pass loop start");
-    for(int it=0; it<3; ++it){
+    for(int it=0; it<SOFT_PASSES; ++it){
         // TRACE("    soft: pass=%d", it);
         int b = improve_mwd_once(I,S);      // spread days first
+        int c = SOFT_ENABLE_CC ? improve_cc_once(I,S) : 0;
         int a = improve_capacity_once(I,S); // then fix room overflows
         int d = improve_room_stability_once(I,S);
-        int c = SOFT_ENABLE_CC ? improve_cc_once(I,S) : 0;
+        
         if(!(a||b||c||d)) break;
     }
     // TRACE("    soft: pass loop end");
 }
+
+// Fix any remaining hard violations: infeasible slots, clashes, room collisions.
+static int hard_sanitize(const Instance* I, Timetable* S){
+    int fixes = 0;
+
+    // 1) move any lecture scheduled in an infeasible timeslot
+    for(int L=0; L<I->total_lectures; ++L){
+        int t = S->lec_to_timeslot[L];
+        if(t<0) continue;
+        int c = I->lecture_to_course[L];
+        if(!I->feasible[c][t]){
+            // move to first feasible slot with a free room (least overflow)
+            int best_tt=-1, best_rr=-1, best_over=1e9;
+            for(int tt=0; tt<I->num_timeslots; ++tt){
+                if(!I->feasible[c][tt]) continue;
+                // avoid teacher/curriculum clashes at tt
+                int clash=0;
+                for(int L2=0; L2<I->total_lectures; ++L2){
+                    if(L2==L) continue;
+                    if(S->lec_to_timeslot[L2]==tt){
+                        int c2 = I->lecture_to_course[L2];
+                        if(c==c2 || I->conflict[c][c2]){ clash=1; break; }
+                    }
+                }
+                if(clash) continue;
+                // pick any free room at tt (least overflow)
+                for(int rr=0; rr<I->num_rooms; ++rr){
+                    int taken=0;
+                    for(int L2=0; L2<I->total_lectures; ++L2)
+                        if(S->lec_to_timeslot[L2]==tt && S->lec_to_room[L2]==rr){ taken=1; break; }
+                    if(taken) continue;
+                    int over = I->courses[c].students - I->rooms[rr].capacity;
+                    if(over < best_over){ best_over=over; best_tt=tt; best_rr=rr; }
+                }
+            }
+            if(best_tt>=0){
+                S->lec_to_timeslot[L]=best_tt;
+                S->lec_to_room[L]=best_rr;
+                ++fixes;
+            }
+        }
+    }
+
+    // 2) resolve room-time collisions (more than one lecture in same (room,t))
+    //    try another free room at same t; else move to another feasible tt
+    for(int t=0; t<I->num_timeslots; ++t){
+        for(int r=0; r<I->num_rooms; ++r){
+            // count occupants in (r,t)
+            int occ_count=0, firstL=-1;
+            for(int L=0; L<I->total_lectures; ++L){
+                if(S->lec_to_timeslot[L]==t && S->lec_to_room[L]==r){
+                    if(firstL<0) firstL=L;
+                    ++occ_count;
+                }
+            }
+            while(occ_count>1){ // move extra occupants
+                // find one to move (not the first)
+                int moveL=-1;
+                for(int L=0; L<I->total_lectures; ++L)
+                    if(S->lec_to_timeslot[L]==t && S->lec_to_room[L]==r && L!=firstL){ moveL=L; break; }
+                if(moveL<0) break;
+
+                int c = I->lecture_to_course[moveL];
+                // try same t, different free room
+                int moved=0;
+                for(int rr=0; rr<I->num_rooms; ++rr){
+                    if(rr==r) continue;
+                    int taken=0;
+                    for(int L2=0; L2<I->total_lectures; ++L2)
+                        if(S->lec_to_timeslot[L2]==t && S->lec_to_room[L2]==rr){ taken=1; break; }
+                    if(!taken){
+                        S->lec_to_room[moveL]=rr; moved=1; ++fixes; --occ_count; break;
+                    }
+                }
+                if(!moved){
+                    // move to another feasible tt without clashes and with a free room
+                    int best_tt=-1, best_rr=-1, best_over=1e9;
+                    for(int tt=0; tt<I->num_timeslots; ++tt){
+                        if(!I->feasible[c][tt]) continue;
+                        // avoid teacher/curriculum clashes
+                        int clash=0;
+                        for(int L2=0; L2<I->total_lectures; ++L2){
+                            if(L2==moveL) continue;
+                            if(S->lec_to_timeslot[L2]==tt){
+                                int c2 = I->lecture_to_course[L2];
+                                if(c==c2 || I->conflict[c][c2]){ clash=1; break; }
+                            }
+                        }
+                        if(clash) continue;
+                        // any free room, least overflow
+                        for(int rr=0; rr<I->num_rooms; ++rr){
+                            int taken=0;
+                            for(int L2=0; L2<I->total_lectures; ++L2)
+                                if(S->lec_to_timeslot[L2]==tt && S->lec_to_room[L2]==rr){ taken=1; break; }
+                            if(taken) continue;
+                            int over = I->courses[c].students - I->rooms[rr].capacity;
+                            if(over < best_over){ best_over=over; best_tt=tt; best_rr=rr; }
+                        }
+                    }
+                    if(best_tt>=0){
+                        S->lec_to_timeslot[moveL]=best_tt;
+                        S->lec_to_room[moveL]=best_rr;
+                        --occ_count; ++fixes;
+                    }else{
+                        break; // nothing we can do right now
+                    }
+                }
+            }
+        }
+    }
+
+    // 3) remove timeslot clashes (teacher/curriculum OR same course twice at same t)
+    for(int t=0; t<I->num_timeslots; ++t){
+        // mark a course already present at t
+        // and move any extra lecture of same course to another slot
+        for(int L=0; L<I->total_lectures; ++L){
+            if(S->lec_to_timeslot[L]!=t) continue;
+            int c = I->lecture_to_course[L];
+
+            // if any OTHER lecture at t conflicts with course c → move this L
+            int need_move = 0;
+            for(int L2=0; L2<I->total_lectures; ++L2){
+                if(L2==L) continue;
+                if(S->lec_to_timeslot[L2]==t){
+                    int c2 = I->lecture_to_course[L2];
+                    if(c==c2 || I->conflict[c][c2]){ need_move=1; break; }
+                }
+            }
+            if(!need_move) continue;
+
+            // find another feasible tt without clashes (least overflow)
+            int best_tt=-1, best_rr=-1, best_over=1e9;
+            for(int tt=0; tt<I->num_timeslots; ++tt){
+                if(tt==t) continue;
+                if(!I->feasible[c][tt]) continue;
+                int clash=0;
+                for(int L3=0; L3<I->total_lectures; ++L3){
+                    if(S->lec_to_timeslot[L3]==tt){
+                        int c3 = I->lecture_to_course[L3];
+                        if(c==c3 || I->conflict[c][c3]){ clash=1; break; }
+                    }
+                }
+                if(clash) continue;
+                for(int rr=0; rr<I->num_rooms; ++rr){
+                    int taken=0;
+                    for(int L3=0; L3<I->total_lectures; ++L3)
+                        if(S->lec_to_timeslot[L3]==tt && S->lec_to_room[L3]==rr){ taken=1; break; }
+                    if(taken) continue;
+                    int over = I->courses[c].students - I->rooms[rr].capacity;
+                    if(over < best_over){ best_over=over; best_tt=tt; best_rr=rr; }
+                }
+            }
+            if(best_tt>=0){
+                S->lec_to_timeslot[L]=best_tt;
+                S->lec_to_room[L]=best_rr;
+                ++fixes;
+            }
+        }
+    }
+
+    return fixes;
+}
+
 
 void aco_refine(Instance* I, ACOParams P, int seeds, const Timetable* seed_solutions,
                 Timetable* out_best)
@@ -791,10 +982,9 @@ void aco_refine(Instance* I, ACOParams P, int seeds, const Timetable* seed_solut
             soft_post_opt(I, &T);
             // TRACE("  iter=%d ant=%d: soft_post_opt end", it, k_ant);
             
-            for (int z = 0; z < 2; ++z) {   // small cap to avoid long loops
-                repair_basic(I, &T);
-                evaluate(I, &T);
-                if (T.hard_violations == 0) break;  // or use your evaluate()’s way to check hard count
+            for(int s=0; s<3; ++s){
+                int f = hard_sanitize(I, &T);
+                if(!f) break;
             }
 
             // score & keep global best
